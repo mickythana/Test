@@ -1,7 +1,305 @@
-git init
-echo "# Initial Commit" > README.md
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin <your-repo-url>
-git push -u origin main
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/ma_predictor.py b/ma_predictor.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e421e5e9bbe49c30884563805ae198cb724554f0
+--- /dev/null
++++ b/ma_predictor.py
+@@ -0,0 +1,295 @@
++"""
++Simple M&A success predictor tailored for investment banking workflows.
++
++This module implements a light-weight logistic regression model using only the
++Python standard library. It can train on the bundled sample dataset and score
++new deals directly from the command line.
++"""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import json
++import math
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Dict, Iterable, List, Sequence, Tuple
++
++FEATURE_NAMES: Sequence[str] = (
++    "revenue_growth",
++    "ebitda_margin",
++    "deal_size",
++    "leverage_ratio",
++    "strategic_fit",
++    "cross_border",
++    "target_private",
++)
++
++
++@dataclass
++class Scaling:
++    mean: float
++    std: float
++
++
++@dataclass
++class Model:
++    weights: List[float]
++    bias: float
++    scaling: Dict[str, Scaling]
++
++    def as_dict(self) -> Dict[str, object]:
++        return {
++            "weights": self.weights,
++            "bias": self.bias,
++            "scaling": {
++                name: {"mean": scale.mean, "std": scale.std}
++                for name, scale in self.scaling.items()
++            },
++        }
++
++    @classmethod
++    def from_dict(cls, payload: Dict[str, object]) -> "Model":
++        raw_scaling = payload["scaling"]
++        scaling = {
++            name: Scaling(mean=values["mean"], std=values["std"])
++            for name, values in raw_scaling.items()
++        }
++        return cls(weights=list(payload["weights"]), bias=payload["bias"], scaling=scaling)
++
++
++@dataclass
++class Sample:
++    features: Dict[str, float]
++    label: int
++
++
++def sigmoid(x: float) -> float:
++    if x >= 0:
++        z = math.exp(-x)
++        return 1.0 / (1.0 + z)
++    z = math.exp(x)
++    return z / (1.0 + z)
++
++
++def dot_product(weights: Sequence[float], values: Sequence[float]) -> float:
++    return sum(w * v for w, v in zip(weights, values))
++
++
++def read_samples(path: Path) -> List[Sample]:
++    with path.open(newline="") as handle:
++        reader = csv.DictReader(handle)
++        samples: List[Sample] = []
++        for row in reader:
++            features = {name: float(row[name]) for name in FEATURE_NAMES}
++            label = int(row["success"])
++            samples.append(Sample(features=features, label=label))
++    return samples
++
++
++def compute_scaling(samples: Iterable[Sample]) -> Dict[str, Scaling]:
++    sums = {name: 0.0 for name in FEATURE_NAMES}
++    sum_squares = {name: 0.0 for name in FEATURE_NAMES}
++    count = 0
++    for sample in samples:
++        count += 1
++        for name in FEATURE_NAMES:
++            value = sample.features[name]
++            sums[name] += value
++            sum_squares[name] += value * value
++
++    scaling: Dict[str, Scaling] = {}
++    for name in FEATURE_NAMES:
++        mean = sums[name] / count
++        variance = max((sum_squares[name] / count) - mean * mean, 1e-8)
++        scaling[name] = Scaling(mean=mean, std=math.sqrt(variance))
++    return scaling
++
++
++def normalize(features: Dict[str, float], scaling: Dict[str, Scaling]) -> List[float]:
++    normalized: List[float] = []
++    for name in FEATURE_NAMES:
++        scale = scaling[name]
++        normalized.append((features[name] - scale.mean) / scale.std)
++    return normalized
++
++
++def train_model(samples: List[Sample], learning_rate: float = 0.2, epochs: int = 2000) -> Model:
++    scaling = compute_scaling(samples)
++    weights = [0.0 for _ in FEATURE_NAMES]
++    bias = 0.0
++
++    for _ in range(epochs):
++        gradient_w = [0.0 for _ in FEATURE_NAMES]
++        gradient_b = 0.0
++        for sample in samples:
++            normalized_features = normalize(sample.features, scaling)
++            linear = dot_product(weights, normalized_features) + bias
++            prediction = sigmoid(linear)
++            error = prediction - sample.label
++            for i, value in enumerate(normalized_features):
++                gradient_w[i] += error * value
++            gradient_b += error
++
++        n = len(samples)
++        for i in range(len(weights)):
++            weights[i] -= learning_rate * (gradient_w[i] / n)
++        bias -= learning_rate * (gradient_b / n)
++
++    return Model(weights=weights, bias=bias, scaling=scaling)
++
++
++def predict_probability(model: Model, features: Dict[str, float]) -> float:
++    normalized = normalize(features, model.scaling)
++    linear = dot_product(model.weights, normalized) + model.bias
++    return sigmoid(linear)
++
++
++def evaluate(model: Model, samples: List[Sample]) -> float:
++    correct = 0
++    for sample in samples:
++        probability = predict_probability(model, sample.features)
++        predicted_label = 1 if probability >= 0.5 else 0
++        if predicted_label == sample.label:
++            correct += 1
++    return correct / len(samples)
++
++
++def save_model(model: Model, path: Path) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(model.as_dict(), indent=2))
++
++
++def load_model(path: Path) -> Model:
++    payload = json.loads(path.read_text())
++    return Model.from_dict(payload)
++
++
++def parse_feature_overrides(arguments: Sequence[str]) -> Dict[str, float]:
++    provided: Dict[str, float] = {}
++    for item in arguments:
++        if "=" not in item:
++            raise ValueError(f"Feature override '{item}' must use the name=value format")
++        name, raw_value = item.split("=", 1)
++        if name not in FEATURE_NAMES:
++            raise ValueError(f"Unknown feature '{name}'. Expected one of {', '.join(FEATURE_NAMES)}")
++        try:
++            provided[name] = float(raw_value)
++        except ValueError as exc:
++            raise ValueError(f"Could not parse value for feature '{name}': {raw_value}") from exc
++
++    missing = [name for name in FEATURE_NAMES if name not in provided]
++    if missing:
++        raise ValueError(f"Missing feature values: {', '.join(missing)}")
++    return provided
++
++
++def run_training(data_path: Path, model_path: Path, epochs: int) -> None:
++    samples = read_samples(data_path)
++    model = train_model(samples, epochs=epochs)
++    accuracy = evaluate(model, samples)
++    save_model(model, model_path)
++    print(f"Trained model saved to {model_path} with training accuracy {accuracy:.2%}")
++
++
++def run_prediction(model_path: Path, overrides: Sequence[str]) -> None:
++    model = load_model(model_path)
++    features = parse_feature_overrides(overrides)
++    probability = predict_probability(model, features)
++    print(json.dumps({"probability_of_success": probability}, indent=2))
++
++
++def run_demo(data_path: Path) -> None:
++    samples = read_samples(data_path)
++    model = train_model(samples)
++    accuracy = evaluate(model, samples)
++    print(f"Demo model training accuracy: {accuracy:.2%}\n")
++
++    scenarios = [
++        {
++            "name": "Strategic platform add-on",
++            "features": {
++                "revenue_growth": 0.15,
++                "ebitda_margin": 0.27,
++                "deal_size": 450,
++                "leverage_ratio": 2.8,
++                "strategic_fit": 1,
++                "cross_border": 0,
++                "target_private": 0,
++            },
++        },
++        {
++            "name": "Distressed cross-border buyout",
++            "features": {
++                "revenue_growth": -0.02,
++                "ebitda_margin": 0.09,
++                "deal_size": 180,
++                "leverage_ratio": 4.9,
++                "strategic_fit": 0,
++                "cross_border": 1,
++                "target_private": 1,
++            },
++        },
++        {
++            "name": "Growth carve-out with high synergy",
++            "features": {
++                "revenue_growth": 0.18,
++                "ebitda_margin": 0.26,
++                "deal_size": 520,
++                "leverage_ratio": 2.5,
++                "strategic_fit": 1,
++                "cross_border": 0,
++                "target_private": 0,
++            },
++        },
++    ]
++
++    for scenario in scenarios:
++        probability = predict_probability(model, scenario["features"])
++        print(
++            f"{scenario['name']}: {probability:.1%} probability of closing successfully",
++        )
++
++
++def build_argument_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description="M&A success probability predictor")
++    subparsers = parser.add_subparsers(dest="command", required=True)
++
++    train_parser = subparsers.add_parser("train", help="Train a model using a CSV dataset")
++    train_parser.add_argument("--data", type=Path, default=Path("data/ma_training_data.csv"))
++    train_parser.add_argument("--model-path", type=Path, default=Path("models/ma_model.json"))
++    train_parser.add_argument("--epochs", type=int, default=2000)
++
++    predict_parser = subparsers.add_parser("predict", help="Predict using a saved model")
++    predict_parser.add_argument("--model-path", type=Path, default=Path("models/ma_model.json"))
++    predict_parser.add_argument(
++        "--features",
++        nargs="+",
++        metavar="name=value",
++        required=True,
++        help="Feature overrides such as revenue_growth=0.1",
++    )
++
++    demo_parser = subparsers.add_parser(
++        "demo", help="Train on bundled data and score example deal scenarios"
++    )
++    demo_parser.add_argument("--data", type=Path, default=Path("data/ma_training_data.csv"))
++
++    return parser
++
++
++def main(argv: Sequence[str] | None = None) -> None:
++    parser = build_argument_parser()
++    args = parser.parse_args(argv)
++
++    if args.command == "train":
++        run_training(args.data, args.model_path, epochs=args.epochs)
++    elif args.command == "predict":
++        run_prediction(args.model_path, args.features)
++    elif args.command == "demo":
++        run_demo(args.data)
++
++
++if __name__ == "__main__":
++    main()
+ 
+EOF
+)
